@@ -52,6 +52,10 @@ class Episode:
     elevation_observation_timestamps: ArrayLike = field(default_factory=list)
     elevation_observations: ArrayLike = field(default_factory=list)
 
+    # `hand_*` and `raw_*` inputs, keyed by event id -> (timestamps, values).
+    # Generic so a new stream needs no new field here; see EpisodeWriter.
+    extras: dict = field(default_factory=dict)
+
 
 def extract_values(value: pa.Array, key: str) -> np.ndarray:
     """Read `key` from a length-1 StructArray, or a flat array as-is."""
@@ -119,6 +123,30 @@ class EpisodeWriter:
                 self._episode.elevation_observation_timestamps,
                 self._episode.elevation_observations,
             )
+        for event_id, (timestamps, values) in self._episode.extras.items():
+            if values:
+                path, write = self._extra_output(event_id)
+                write(path, timestamps, values)
+
+    def _extra_output(self, event_id):
+        """Map a `hand_*` / `raw_*` input onto its output path and writer.
+
+            hand_left_action      -> action/hands/left/state.parquet
+            hand_left_observation -> obs/hands/left/state.parquet
+            raw_wrist             -> raw/wrist.parquet
+
+        `hand_*` carries a kinematic struct like the arms; `raw_*` is teleop
+        provenance (source poses, landmarks) and is a plain vector per sample.
+        """
+        if event_id.startswith("hand_"):
+            side, kind = event_id.removeprefix("hand_").split("_", 1)
+            sub = "obs" if kind == "observation" else kind
+            return (
+                self._base_directory / sub / "hands" / side,
+                self._write_kinematic_state,
+            )
+        name = event_id.removeprefix("raw_")
+        return self._base_directory / "raw" / f"{name}.parquet", self._write_positions
 
     def cancel(self):
         """Cancel this episode."""
@@ -127,6 +155,12 @@ class EpisodeWriter:
     def _write_positions(self, output_path, timestamps, positions):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         list_type = pa.list_(pa.float32())
+        # One vector per sample. Sources that wrap it in a single-field struct
+        # (the IK pose target) are unwrapped so raw/ stays uniform.
+        first = positions[0]
+        if pa.types.is_struct(first.type):
+            (field,) = first.type.names
+            positions = [extract_values(p, field) for p in positions]
         table = pa.table(
             {
                 "timestamp": pa.array(timestamps, type=pa.timestamp("ns")),
@@ -149,6 +183,10 @@ class EpisodeWriter:
                 "qvel",
                 "qtorque",
                 "pose",
+                # What was asked for before a follower-side rate limiter clamped
+                # it. Recorded next to `qpos` (what was actually sent) so the
+                # limiter's intervention is visible per sample.
+                "qpos_pre_slew",
             ]  # currently only support these fields
             state_fields = {"timestamp": pa.array(timestamps, type=pa.timestamp("ns"))}
             for field_name in field_names:
@@ -440,6 +478,10 @@ def main():
             # elevation_action -> elevation_actions, elevation_action_timestamps
             getattr(episode, f"{event_id}s").append(event["value"])
             getattr(episode, f"{event_id}_timestamps").append(timestamp)
+        elif event_id.startswith(("hand_", "raw_")):
+            timestamps, values = episode.extras.setdefault(event_id, ([], []))
+            timestamps.append(timestamp)
+            values.append(event["value"])
         elif event_id.startswith("camera_"):
             name = event_id.removeprefix("camera_")
             image = event["value"]
