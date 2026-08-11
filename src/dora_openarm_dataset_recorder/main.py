@@ -387,8 +387,8 @@ def main():
     )
     parser.add_argument(
         "--name",
-        default=os.getenv("NAME", "dataset"),
-        help="The dataset name",
+        default=os.getenv("NAME", "%Y%m%d-%H%M%S"),
+        help="The dataset name (strftime directives are expanded)",
         type=str,
     )
     parser.add_argument(
@@ -399,6 +399,7 @@ def main():
         type=str,
     )
     args = parser.parse_args()
+    args.name = datetime.datetime.now().strftime(args.name)
 
     node = dora.Node()
     if args.metadata_file is None:
@@ -408,6 +409,7 @@ def main():
             metadata = yaml.safe_load(f)
     _collect_dynamic_metadata(metadata, args, node)
     dataset_writer = DatasetWriter(args.directory, args.name, metadata)
+    print(f"[recorder] dataset: {args.directory / args.name}", flush=True)
     episode = None
     episode_writer = None
 
